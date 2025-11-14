@@ -1,0 +1,101 @@
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html, body {
+  padding: 0;
+  margin: 0;
+  font-family: Inter, system-ui, sans-serif;
+  background: radial-gradient(circle at top, #020617 0, #020617 40%, #000000 100%);
+  color: #e5e7eb;
+}
+
+.page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.container { width: 100%; max-width: 720px; }
+
+.card {
+  background: rgba(2, 6, 23, 0.9);
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  padding: 20px;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.8);
+}
+
+.logo-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.logo-row img { height: 34px; }
+
+.badge {
+  background: rgba(34, 197, 194, 0.2);
+  color: #a5f3fc;
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 197, 194, 0.6);
+}
+
+.input-row { display: flex; gap: 8px; margin-top: 12px; }
+
+.input-url {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  background: rgba(15, 23, 42, 0.8);
+  color: #e5e7eb;
+  font-size: 0.95rem;
+}
+
+.btn-primary {
+  padding: 10px 18px;
+  background: linear-gradient(135deg, #00c9ad, #0ea5e9);
+  color: #020617;
+  border-radius: 999px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.result-wrapper { margin-top: 16px; }
+
+.result-card {
+  background: radial-gradient(circle at top, rgba(15,23,42,0.9), #020617);
+  border-radius: 16px;
+  border: 1px solid rgba(45, 212, 191, 0.4);
+  padding: 16px 18px;
+}
+
+.result-label { font-weight: 600; color: #cbd5f5; }
+
+.result-section-title {
+  margin-top: 10px;
+  font-size: 0.86rem;
+  color: #9ca3af;
+  text-transform: uppercase;
+}
+
+.result-list { padding-left: 18px; }
+
+.risk-pill {
+  display: inline-flex; padding: 4px 10px; border-radius: 999px; font-weight: 600;
+}
+.risk-green { background: rgba(22,163,74,0.15); border: 1px solid #22c55e; color: #86efac; }
+.risk-yellow { background: rgba(202,138,4,0.12); border: 1px solid #facc15; color: #fde68a; }
+.risk-red { background: rgba(185,28,28,0.18); border: 1px solid #f87171; color: #fecaca; }
+
+.btn-secondary {
+  margin-top: 10px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  background: transparent;
+  color: #e5e7eb;
+  cursor: pointer;
+}
+
+.error-text { color: #fecaca; margin-top: 10px; }
