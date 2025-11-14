@@ -5,8 +5,7 @@ import * as cheerio from "cheerio";
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------------- YOUR GPT LOGIC PROMPT ----------------
-const SYSTEM_PROMPT = `
-`;
+
 const SYSTEM_PROMPT = `
 You are "ValetPe Return Policy Decoder", an assistant that helps INDIAN online shoppers understand return/refund/exchange policies.
 
