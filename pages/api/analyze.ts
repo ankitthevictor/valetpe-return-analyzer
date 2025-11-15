@@ -1,22 +1,18 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
+import * as cheerio from "cheerio";
 
-// ---------------- OPENAI CLIENT ----------------
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ---------------- SYSTEM PROMPT ----------------
 const SYSTEM_PROMPT = `
 You are "ValetPe Return Policy Decoder", an assistant helping INDIAN online shoppers understand return, refund & exchange policies.
 
-You will NOT engage in conversation.  
+You will NOT engage in conversation.
 You only receive raw policy text (messy, long, or incomplete).
 
---------------------------------
-WHAT YOU MUST OUTPUT
---------------------------------
-Return ONLY valid JSON in the EXACT structure below:
+Return ONLY valid JSON:
 
 {
   "brand": "string",
@@ -32,30 +28,20 @@ Return ONLY valid JSON in the EXACT structure below:
   "tip": "one practical tip"
 }
 
---------------------------------
-INTERPRETATION RULES
---------------------------------
-Think like a consumer advocate.
+Think like a consumer advocate:
+- If ANY point is unclear -> "Not mentioned".
+- Strict, vague, or one-sided policies -> lower risk score.
+- Clear, long window, free pickup, refund-to-source -> higher risk score.
 
-• If ANY point is unclear → mark it "Not mentioned".  
-• If the policy is vague, contradictory or restrictive → risk goes DOWN.  
-• If the policy is clear, long window, free pickup, refund-to-source → risk goes UP.  
-• ALWAYS fill all fields — NEVER output null or empty strings.
+0–4  = 🔴 High risk
+5–7  = 🟡 Medium / Read conditions
+8–10 = 🟢 Customer-friendly
 
---------------------------------
-RISK SCORE RULE OF THUMB
---------------------------------
-0–4  = 🔴 High risk  
-5–7  = 🟡 Medium / Read conditions  
-8–10 = 🟢 Customer-friendly  
-
---------------------------------
-BE VERY CONCISE
---------------------------------
-Users want SHORT summaries, not paragraphs.
+Keep everything SHORT.
 `;
 
-// ---------------- FALLBACK ----------------
+const KEYWORDS = ["return", "refund", "exchange", "cancellation"];
+
 function fallbackResponse(domain: string) {
   return {
     brand: domain || "Unknown",
@@ -74,28 +60,111 @@ function fallbackResponse(domain: string) {
   };
 }
 
-// ---------------- HANDLER ----------------
+async function fetchHtml(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch URL: ${res.status} ${res.statusText}`);
+  }
+  return await res.text();
+}
+
+async function extractPolicyText(
+  productUrl: string
+): Promise<{ text: string; domain: string }> {
+  const urlObj = new URL(productUrl);
+  const base = urlObj.origin;
+  const domain = urlObj.hostname;
+
+  const candidates: string[] = [];
+
+  try {
+    const html = await fetchHtml(productUrl);
+    const $ = cheerio.load(html);
+
+    // collect anchor candidates
+    $("a").each((_, el) => {
+      const t = ($(el).text() || "").toLowerCase();
+      const h = ($(el).attr("href") || "").toLowerCase();
+      const combined = t + " " + h;
+      if (KEYWORDS.some((k) => combined.includes(k))) {
+        try {
+          const abs = new URL(h, base).toString();
+          if (!candidates.includes(abs)) candidates.push(abs);
+        } catch {
+          // ignore invalid URLs
+        }
+      }
+    });
+
+    // if no policy link found, just use page text
+    if (candidates.length === 0) {
+      $("script, style, noscript").remove();
+      const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
+      return { text: txt, domain };
+    }
+  } catch (err) {
+    console.error("Error during initial scraping:", err);
+    return { text: "", domain };
+  }
+
+  // try each candidate policy URL
+  for (const candidateUrl of candidates) {
+    try {
+      const html = await fetchHtml(candidateUrl);
+      const $ = cheerio.load(html);
+      $("script, style, noscript").remove();
+      const txt = $("body").text().replace(/\s+/g, " ").trim();
+      if (txt.length > 0) {
+        return { text: txt.slice(0, 24000), domain };
+      }
+    } catch (err) {
+      console.error("Error fetching candidate policy URL:", candidateUrl, err);
+    }
+  }
+
+  // last resort: use original page text
+  try {
+    const html = await fetchHtml(productUrl);
+    const $ = cheerio.load(html);
+    $("script, style, noscript").remove();
+    const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
+    return { text: txt, domain };
+  } catch (err) {
+    console.error("Error in final fallback:", err);
+    return { text: "", domain };
+  }
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
   if (req.method !== "POST") return res.status(405).send("Only POST allowed");
 
-  const { policyText, domain } = req.body as {
-    policyText?: string;
-    domain?: string;
-  };
+  const { url } = req.body as { url?: string };
 
-  // ❗ Only fallback if text is literally empty
-  if (!policyText || policyText.trim().length === 0) {
-    return res.status(200).json(fallbackResponse(domain || "Unknown"));
+  if (!url || typeof url !== "string") {
+    return res.status(200).json(fallbackResponse("Unknown"));
   }
 
   try {
+    const { text: policyText, domain } = await extractPolicyText(url);
+
+    if (!policyText || policyText.trim().length === 0) {
+      return res.status(200).json(fallbackResponse(domain));
+    }
+
     const userPrompt = `
 Summarize the following policy EXACTLY according to the JSON schema:
 
-"""${policyText.slice(0, 24000)}"""
+"""${policyText}"""
 `;
 
     const completion = await client.chat.completions.create({
@@ -109,17 +178,14 @@ Summarize the following policy EXACTLY according to the JSON schema:
 
     const raw = completion.choices[0].message.content || "{}";
 
-    // Try parsing directly
     let parsed: any;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      // Try extracting JSON from messy LLM output
       const match = raw.match(/\{[\s\S]*\}/);
       parsed = match ? JSON.parse(match[0]) : {};
     }
 
-    // Build final safe response
     const response = {
       brand: parsed.brand || domain || "Unknown",
       category: parsed.category || "Other",
@@ -127,26 +193,21 @@ Summarize the following policy EXACTLY according to the JSON schema:
       refundType: parsed.refundType || "Not mentioned",
       returnMethod: parsed.returnMethod || "Not mentioned",
       costs: parsed.costs || "Not mentioned",
-
       conditions:
         Array.isArray(parsed.conditions) && parsed.conditions.length > 0
           ? parsed.conditions.slice(0, 3)
           : ["Details not clearly mentioned in policy."],
-
       riskScore:
         parsed.riskScore || "5/10 – 🟡 Okay, but review policy carefully",
-
       riskLevel:
         parsed.riskLevel === "green" ||
         parsed.riskLevel === "yellow" ||
         parsed.riskLevel === "red"
           ? parsed.riskLevel
           : ("yellow" as const),
-
       benchmark:
         parsed.benchmark ||
         "Broadly in line with what Indian brands usually follow.",
-
       tip:
         parsed.tip ||
         "Keep original packaging/tags until you decide to keep the product.",
@@ -155,8 +216,6 @@ Summarize the following policy EXACTLY according to the JSON schema:
     return res.status(200).json(response);
   } catch (err: any) {
     console.error("OpenAI error:", err);
-
-    // 🔴 Surface actual AI errors to frontend
     return res.status(500).json({
       error:
         "AI summarisation failed: " +

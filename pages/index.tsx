@@ -22,50 +22,6 @@ export default function Home() {
   const [data, setData] = useState<Result | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
 
-  // Normalize URL (ensure it has https://)
-  const normalizeUrl = (raw: string) => {
-    let u = raw.trim();
-    if (!u.startsWith("http://") && !u.startsWith("https://")) {
-      u = "https://" + u;
-    }
-    return new URL(u);
-  };
-
-  // Fetch HTML from browser via AllOrigins proxy
-  const fetchPolicyText = async (cleanUrl: URL): Promise<string> => {
-    const target = cleanUrl.toString();
-
-    // Use AllOrigins raw endpoint (best for scraping)
-    const proxyUrl =
-      "https://api.allorigins.win/raw?url=" + encodeURIComponent(target);
-
-    const res = await fetch(proxyUrl);
-    if (!res.ok) {
-      throw new Error(`Failed to fetch page HTML (status ${res.status})`);
-    }
-
-    const html = await res.text();
-
-    // Parse HTML in browser
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-
-    // Remove scripts, styles
-    ["script", "style", "noscript"].forEach((tag) => {
-      doc.querySelectorAll(tag).forEach((el) => el.remove());
-    });
-
-    // Extract clean text
-    const body = doc.body;
-    let text = body ? body.textContent || "" : "";
-    text = text.replace(/\s+/g, " ").trim();
-
-    console.log("Extracted policy text length:", text.length);
-    console.log("Extracted text sample:", text.slice(0, 400));
-
-    return text;
-  };
-
   const analyze = async () => {
     setError(null);
     setData(null);
@@ -78,17 +34,10 @@ export default function Home() {
     setLoading(true);
 
     try {
-      const cleanUrl = normalizeUrl(url);
-      const domain = cleanUrl.hostname;
-
-      // 1) Extract policy text in the browser
-      const policyText = await fetchPolicyText(cleanUrl);
-
-      // 2) Send extracted text to backend API for GPT summarisation
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ policyText, domain }),
+        body: JSON.stringify({ url }),
       });
 
       let json: any;
@@ -136,8 +85,8 @@ export default function Home() {
 
           <h1>Decode Any Return Policy in Seconds</h1>
           <p className="card-subtitle">
-            Paste any product or policy link. We&apos;ll read the page in your
-            browser and show a simple risk summary.
+            Paste any product or policy link. We&apos;ll read the page and show
+            a simple risk summary.
           </p>
 
           <div className="input-row">
