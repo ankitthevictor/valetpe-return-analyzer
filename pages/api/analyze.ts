@@ -119,7 +119,8 @@ export default async function handler(
     domain?: string;
   };
 
-  if (!policyText || policyText.trim().length < 200) {
+  // ✅ NEW: only fallback if there is literally NO text.
+  if (!policyText || policyText.trim().length === 0) {
     return res.status(200).json(fallbackResponse(domain || "Unknown"));
   }
 
