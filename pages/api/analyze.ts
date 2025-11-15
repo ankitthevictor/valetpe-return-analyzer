@@ -61,12 +61,6 @@ Then map numeric score to:
 - red    = high risk (0–4)
 
 6) Benchmark vs Indian norms for that category: 1 sentence.
-Examples for reference (do NOT output these literally):
-- Fashion: many Indian sites offer 7–30 days with free pickup and refunds to source.
-- Beauty: often only unopened items, many non-returnable except damage/defect.
-- Electronics: often 7-day defect-only replacement, not "change of mind".
-- Furniture/large appliances: usually damage/defect only.
-- Jewelry/innerwear/custom: usually non-returnable except manufacturing defects.
 
 7) One short practical tip (1 line) for the shopper.
 
@@ -101,12 +95,23 @@ Rules:
 
 const KEYWORDS = ["return", "refund", "exchange", "cancellation"];
 
+// Common Shopify-style policy paths we will try even if no link is detected
+const SHOPIFY_POLICY_PATHS = [
+  "/pages/returns-and-exchanges",
+  "/pages/return-and-exchange",
+  "/pages/return-policy",
+  "/pages/refund-policy",
+  "/policies/return-policy",
+  "/policies/refund-policy",
+  "/policies/shipping-policy",
+];
+
 async function fetchHtml(url: string): Promise<string> {
   const res = await fetch(url, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
   });
 
@@ -116,18 +121,20 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
-async function extractPolicyText(productUrl: string): Promise<{ text: string; domain: string }> {
+async function extractPolicyText(
+  productUrl: string
+): Promise<{ text: string; domain: string }> {
   const urlObj = new URL(productUrl);
   const base = urlObj.origin;
   const domain = urlObj.hostname;
 
-  let policyText = "";
+  const candidates: string[] = [];
+
   try {
     const html = await fetchHtml(productUrl);
     const $ = cheerio.load(html);
 
-    // Find likely policy links
-    const candidates: string[] = [];
+    // 1) Anchor-based candidates
     $("a").each((_, el) => {
       const t = ($(el).text() || "").toLowerCase();
       const h = ($(el).attr("href") || "").toLowerCase();
@@ -141,21 +148,60 @@ async function extractPolicyText(productUrl: string): Promise<{ text: string; do
         }
       }
     });
-
-    let policyHtml = html;
-    if (candidates.length > 0) {
-      // use first candidate
-      policyHtml = await fetchHtml(candidates[0]);
-    }
-
-    const $$ = cheerio.load(policyHtml);
-    $$("script, style, noscript").remove();
-    policyText = $$("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
   } catch (err) {
-    console.error("Error during scraping:", err);
+    console.error("Error during initial scraping:", err);
   }
 
-  return { text: policyText, domain };
+  // 2) Add Shopify-style known paths as extra candidates (for domains like wearcomet.com)
+  for (const path of SHOPIFY_POLICY_PATHS) {
+    try {
+      const abs = new URL(path, base).toString();
+      if (!candidates.includes(abs)) candidates.push(abs);
+    } catch {
+      // ignore
+    }
+  }
+
+  // If no candidates at all, try just the original page text
+  if (candidates.length === 0) {
+    try {
+      const html = await fetchHtml(productUrl);
+      const $ = cheerio.load(html);
+      $("script, style, noscript").remove();
+      const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
+      return { text: txt, domain };
+    } catch (err) {
+      console.error("Error reading original page as fallback:", err);
+      return { text: "", domain };
+    }
+  }
+
+  // 3) Try candidates in order until we find a decently long policy text
+  for (const candidateUrl of candidates) {
+    try {
+      const html = await fetchHtml(candidateUrl);
+      const $ = cheerio.load(html);
+      $("script, style, noscript").remove();
+      const txt = $("body").text().replace(/\s+/g, " ").trim();
+      if (txt.length > 400) {
+        return { text: txt.slice(0, 24000), domain };
+      }
+    } catch (err) {
+      console.error("Error fetching candidate policy URL:", candidateUrl, err);
+    }
+  }
+
+  // 4) If none of the candidates gave enough text, last-resort: first candidate raw text
+  try {
+    const html = await fetchHtml(candidates[0]);
+    const $ = cheerio.load(html);
+    $("script, style, noscript").remove();
+    const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
+    return { text: txt, domain };
+  } catch (err) {
+    console.error("Error in final candidate fallback:", err);
+    return { text: "", domain };
+  }
 }
 
 function fallbackResponse(domain: string) {
@@ -174,7 +220,10 @@ function fallbackResponse(domain: string) {
   };
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
   if (req.method !== "POST") return res.status(405).end();
 
   const { url } = req.body as { url?: string };
@@ -185,7 +234,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     const { text: policyText, domain } = await extractPolicyText(url);
 
-    // If scraping failed or returned almost nothing, return fallback
+    // If scraping totally failed, fallback
     if (!policyText || policyText.length < 200) {
       return res.status(200).json(fallbackResponse(domain));
     }
@@ -215,7 +264,6 @@ Policy text:
       parsed = match ? JSON.parse(match[0]) : {};
     }
 
-    // Basic normalization and fallbacks
     const response = {
       brand: parsed.brand || domain,
       category: parsed.category || "Other",
@@ -243,7 +291,6 @@ Policy text:
     return res.status(200).json(response);
   } catch (err) {
     console.error("Fatal error in handler:", err);
-    // Even if OpenAI or something else fails, return fallback.
     return res.status(200).json(fallbackResponse("Unknown"));
   }
 }
