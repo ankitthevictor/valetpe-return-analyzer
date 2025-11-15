@@ -34,17 +34,26 @@ export default function Home() {
     setLoading(true);
     try {
       const res = await fetch("/api/analyze", {
-        method: "POST",
+        method: "POST",                             // 🔴 ENSURE IT'S POST
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
       });
 
-      if (!res.ok) throw new Error("Unable to analyze policy");
+      let json: any;
+      try {
+        json = await res.json();                   // try to read response as JSON
+      } catch {
+        throw new Error(`Server error (status ${res.status}) – invalid JSON.`);
+      }
 
-      const json = await res.json();
+      if (!res.ok) {                               // backend explicitly sent error
+        throw new Error(json.error || `Server returned ${res.status}`);
+      }
+
       setData(json);
     } catch (e: any) {
-      setError(e.message);
+      console.error(e);
+      setError(e.message || "Something went wrong while analyzing.");
     } finally {
       setLoading(false);
     }
@@ -52,11 +61,13 @@ export default function Home() {
 
   const downloadCard = async () => {
     if (!cardRef.current) return;
-
-    const canvas = await html2canvas(cardRef.current, { backgroundColor: "#020617", scale: 2 });
+    const canvas = await html2canvas(cardRef.current, {
+      backgroundColor: "#020617",
+      scale: 2,
+    });
     const link = document.createElement("a");
     link.download = "valetpe-return-summary.png";
-    link.href = canvas.toDataURL();
+    link.href = canvas.toDataURL("image/png");
     link.click();
   };
 
@@ -108,7 +119,9 @@ export default function Home() {
 
                 <div className="result-section-title">Key Conditions</div>
                 <ul className="result-list">
-                  {data.conditions.map((c, i) => <li key={i}>{c}</li>)}
+                  {data.conditions.map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
                 </ul>
 
                 <div className="result-section-title">Risk & Benchmark</div>
