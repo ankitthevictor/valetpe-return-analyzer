@@ -1,6 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import * as cheerio from "cheerio";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -93,117 +92,6 @@ Rules:
 `;
 // -----------------------------------
 
-const KEYWORDS = ["return", "refund", "exchange", "cancellation"];
-
-// Common Shopify-style policy paths we will try even if no link is detected
-const SHOPIFY_POLICY_PATHS = [
-  "/pages/returns-and-exchanges",
-  "/pages/return-and-exchange",
-  "/pages/return-policy",
-  "/pages/refund-policy",
-  "/policies/return-policy",
-  "/policies/refund-policy",
-  "/policies/shipping-policy",
-];
-
-async function fetchHtml(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to fetch URL: ${res.status} ${res.statusText}`);
-  }
-  return await res.text();
-}
-
-async function extractPolicyText(
-  productUrl: string
-): Promise<{ text: string; domain: string }> {
-  const urlObj = new URL(productUrl);
-  const base = urlObj.origin;
-  const domain = urlObj.hostname;
-
-  const candidates: string[] = [];
-
-  try {
-    const html = await fetchHtml(productUrl);
-    const $ = cheerio.load(html);
-
-    // 1) Anchor-based candidates
-    $("a").each((_, el) => {
-      const t = ($(el).text() || "").toLowerCase();
-      const h = ($(el).attr("href") || "").toLowerCase();
-      const combined = t + " " + h;
-      if (KEYWORDS.some((k) => combined.includes(k))) {
-        try {
-          const abs = new URL(h, base).toString();
-          if (!candidates.includes(abs)) candidates.push(abs);
-        } catch {
-          // ignore invalid URLs
-        }
-      }
-    });
-  } catch (err) {
-    console.error("Error during initial scraping:", err);
-  }
-
-  // 2) Add Shopify-style known paths as extra candidates (for domains like wearcomet.com)
-  for (const path of SHOPIFY_POLICY_PATHS) {
-    try {
-      const abs = new URL(path, base).toString();
-      if (!candidates.includes(abs)) candidates.push(abs);
-    } catch {
-      // ignore
-    }
-  }
-
-  // If no candidates at all, try just the original page text
-  if (candidates.length === 0) {
-    try {
-      const html = await fetchHtml(productUrl);
-      const $ = cheerio.load(html);
-      $("script, style, noscript").remove();
-      const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
-      return { text: txt, domain };
-    } catch (err) {
-      console.error("Error reading original page as fallback:", err);
-      return { text: "", domain };
-    }
-  }
-
-  // 3) Try candidates in order until we find a decently long policy text
-  for (const candidateUrl of candidates) {
-    try {
-      const html = await fetchHtml(candidateUrl);
-      const $ = cheerio.load(html);
-      $("script, style, noscript").remove();
-      const txt = $("body").text().replace(/\s+/g, " ").trim();
-      if (txt.length > 400) {
-        return { text: txt.slice(0, 24000), domain };
-      }
-    } catch (err) {
-      console.error("Error fetching candidate policy URL:", candidateUrl, err);
-    }
-  }
-
-  // 4) If none of the candidates gave enough text, last-resort: first candidate raw text
-  try {
-    const html = await fetchHtml(candidates[0]);
-    const $ = cheerio.load(html);
-    $("script, style, noscript").remove();
-    const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
-    return { text: txt, domain };
-  } catch (err) {
-    console.error("Error in final candidate fallback:", err);
-    return { text: "", domain };
-  }
-}
-
 function fallbackResponse(domain: string) {
   return {
     brand: domain || "Unknown",
@@ -226,23 +114,20 @@ export default async function handler(
 ) {
   if (req.method !== "POST") return res.status(405).end();
 
-  const { url } = req.body as { url?: string };
-  if (!url || typeof url !== "string") {
-    return res.status(200).json(fallbackResponse("Unknown"));
+  const { policyText, domain } = req.body as {
+    policyText?: string;
+    domain?: string;
+  };
+
+  if (!policyText || policyText.trim().length < 200) {
+    return res.status(200).json(fallbackResponse(domain || "Unknown"));
   }
 
   try {
-    const { text: policyText, domain } = await extractPolicyText(url);
-
-    // If scraping totally failed, fallback
-    if (!policyText || policyText.length < 200) {
-      return res.status(200).json(fallbackResponse(domain));
-    }
-
     const userPrompt = `
 Return a JSON summary following the schema in the system instructions.
 Policy text:
-"""${policyText}"""
+"""${policyText.slice(0, 24000)}"""
 `;
 
     const completion = await client.chat.completions.create({
@@ -256,7 +141,6 @@ Policy text:
 
     const raw = completion.choices[0].message.content || "{}";
     let parsed: any;
-
     try {
       parsed = JSON.parse(raw);
     } catch {
@@ -265,7 +149,7 @@ Policy text:
     }
 
     const response = {
-      brand: parsed.brand || domain,
+      brand: parsed.brand || domain || "Unknown",
       category: parsed.category || "Other",
       returnWindow: parsed.returnWindow || "Not mentioned",
       refundType: parsed.refundType || "Not mentioned",
@@ -291,6 +175,6 @@ Policy text:
     return res.status(200).json(response);
   } catch (err) {
     console.error("Fatal error in handler:", err);
-    return res.status(200).json(fallbackResponse("Unknown"));
+    return res.status(200).json(fallbackResponse(domain || "Unknown"));
   }
 }
