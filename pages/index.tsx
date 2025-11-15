@@ -1,5 +1,6 @@
 import { useState, useRef } from "react";
 import html2canvas from "html2canvas";
+import Image from "next/image";
 
 type Result = {
   brand: string;
@@ -79,7 +80,13 @@ export default function Home() {
       <div className="container">
         <div className="card">
           <div className="logo-row">
-            <img src="/valetpe-logo.png" alt="ValetPe" />
+            <Image
+              src="/valetpe-logo.png"
+              alt="ValetPe"
+              width={160}
+              height={40}
+              priority
+            />
             <span className="badge">Return Policy Decoder · India</span>
           </div>
 

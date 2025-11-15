@@ -2,10 +2,43 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
 import * as cheerio from "cheerio";
 
+// ---------------------------------------------
+// TYPES
+// ---------------------------------------------
+type RiskLevel = "green" | "yellow" | "red";
+
+type ApiResult = {
+  brand: string;
+  category: string;
+  returnWindow: string;
+  refundType: string;
+  returnMethod: string;
+  costs: string;
+  conditions: string[];
+  riskScore: string;
+  riskLevel: RiskLevel;
+  benchmark: string;
+  tip: string;
+};
+
+// ---------------------------------------------
+// OPENAI CLIENT (cheaper model gpt-4o-mini)
+// ---------------------------------------------
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// ---------------------------------------------
+// SIMPLE IN-MEMORY CACHE
+// ---------------------------------------------
+// NOTE: This cache lives per Vercel function instance.
+// It won't be global across regions but still saves a lot of calls.
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const cache = new Map<string, { timestamp: number; data: ApiResult }>();
+
+// ---------------------------------------------
+// SYSTEM PROMPT
+// ---------------------------------------------
 const SYSTEM_PROMPT = `
 You are "ValetPe Return Policy Decoder", an assistant helping INDIAN online shoppers understand return, refund & exchange policies.
 
@@ -28,21 +61,19 @@ Return ONLY valid JSON:
   "tip": "one practical tip"
 }
 
-Think like a consumer advocate:
-- If ANY point is unclear -> "Not mentioned".
-- Strict, vague, or one-sided policies -> lower risk score.
-- Clear, long window, free pickup, refund-to-source -> higher risk score.
-
-0–4  = 🔴 High risk
-5–7  = 🟡 Medium / Read conditions
-8–10 = 🟢 Customer-friendly
-
-Keep everything SHORT.
+Rules:
+- If ANY detail missing → "Not mentioned".
+- Strict, vague, or one-sided policies → lower score.
+- Clear, free pickup, long window → higher score.
+- Keep output SHORT.
 `;
 
+// ---------------------------------------------
+// HELPERS
+// ---------------------------------------------
 const KEYWORDS = ["return", "refund", "exchange", "cancellation"];
 
-function fallbackResponse(domain: string) {
+function fallbackResponse(domain: string): ApiResult {
   return {
     brand: domain || "Unknown",
     category: "Other",
@@ -54,7 +85,7 @@ function fallbackResponse(domain: string) {
       "No clear return/refund policy could be analyzed for this site.",
     ],
     riskScore: "2/10 – 🔴 High risk",
-    riskLevel: "red" as const,
+    riskLevel: "red",
     benchmark: "This is riskier than typical Indian e-commerce policies.",
     tip: "Be cautious for high-value orders; confirm policy with customer support.",
   };
@@ -65,7 +96,6 @@ async function fetchHtml(url: string): Promise<string> {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
   });
 
@@ -75,6 +105,9 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
+// ---------------------------------------------
+// Scraping logic
+// ---------------------------------------------
 async function extractPolicyText(
   productUrl: string
 ): Promise<{ text: string; domain: string }> {
@@ -88,11 +121,11 @@ async function extractPolicyText(
     const html = await fetchHtml(productUrl);
     const $ = cheerio.load(html);
 
-    // collect anchor candidates
     $("a").each((_, el) => {
       const t = ($(el).text() || "").toLowerCase();
       const h = ($(el).attr("href") || "").toLowerCase();
       const combined = t + " " + h;
+
       if (KEYWORDS.some((k) => combined.includes(k))) {
         try {
           const abs = new URL(h, base).toString();
@@ -103,33 +136,30 @@ async function extractPolicyText(
       }
     });
 
-    // if no policy link found, just use page text
     if (candidates.length === 0) {
       $("script, style, noscript").remove();
       const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
       return { text: txt, domain };
     }
   } catch (err) {
-    console.error("Error during initial scraping:", err);
+    console.error("Scraping error:", err);
     return { text: "", domain };
   }
 
-  // try each candidate policy URL
-  for (const candidateUrl of candidates) {
+  // Try candidate pages
+  for (const c of candidates) {
     try {
-      const html = await fetchHtml(candidateUrl);
+      const html = await fetchHtml(c);
       const $ = cheerio.load(html);
       $("script, style, noscript").remove();
       const txt = $("body").text().replace(/\s+/g, " ").trim();
-      if (txt.length > 0) {
-        return { text: txt.slice(0, 24000), domain };
-      }
-    } catch (err) {
-      console.error("Error fetching candidate policy URL:", candidateUrl, err);
+      if (txt.length > 0) return { text: txt.slice(0, 24000), domain };
+    } catch {
+      // ignore and try next candidate
     }
   }
 
-  // last resort: use original page text
+  // Fallback to original
   try {
     const html = await fetchHtml(productUrl);
     const $ = cheerio.load(html);
@@ -137,39 +167,68 @@ async function extractPolicyText(
     const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
     return { text: txt, domain };
   } catch (err) {
-    console.error("Error in final fallback:", err);
+    console.error("Final fallback error:", err);
     return { text: "", domain };
   }
 }
 
+// ---------------------------------------------
+// MAIN HANDLER
+// ---------------------------------------------
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
   if (req.method !== "POST") return res.status(405).send("Only POST allowed");
 
-  const { url } = req.body as { url?: string };
+  let { url } = req.body as { url?: string };
 
   if (!url || typeof url !== "string") {
     return res.status(200).json(fallbackResponse("Unknown"));
   }
 
+  // ---------------------------------------------
+  // NORMALIZE URL (handles jumkey.com, www.jumkey.com, etc.)
+  // ---------------------------------------------
+  url = url.trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+
+  const cacheKey = url; // we cache per normalized URL
+
+  // ---------------------------------------------
+  // CACHE CHECK
+  // ---------------------------------------------
+  const cached = cache.get(cacheKey);
+  const now = Date.now();
+
+  if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+    console.log("Serving from cache:", cacheKey);
+    return res.status(200).json(cached.data);
+  }
+
+  console.log("Cache miss, fetching + summarising:", cacheKey);
+
   try {
     const { text: policyText, domain } = await extractPolicyText(url);
 
     if (!policyText || policyText.trim().length === 0) {
-      return res.status(200).json(fallbackResponse(domain));
+      const fallback = fallbackResponse(domain);
+      cache.set(cacheKey, { timestamp: now, data: fallback });
+      return res.status(200).json(fallback);
     }
 
     const userPrompt = `
-Summarize the following policy EXACTLY according to the JSON schema:
+Summarize the following policy EXACTLY as JSON:
 
 """${policyText}"""
 `;
 
     const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini", // cheaper model
       temperature: 0.2,
+      max_tokens: 500,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
@@ -186,8 +245,8 @@ Summarize the following policy EXACTLY according to the JSON schema:
       parsed = match ? JSON.parse(match[0]) : {};
     }
 
-    const response = {
-      brand: parsed.brand || domain || "Unknown",
+    const response: ApiResult = {
+      brand: parsed.brand || domain,
       category: parsed.category || "Other",
       returnWindow: parsed.returnWindow || "Not mentioned",
       refundType: parsed.refundType || "Not mentioned",
@@ -197,21 +256,25 @@ Summarize the following policy EXACTLY according to the JSON schema:
         Array.isArray(parsed.conditions) && parsed.conditions.length > 0
           ? parsed.conditions.slice(0, 3)
           : ["Details not clearly mentioned in policy."],
-      riskScore:
-        parsed.riskScore || "5/10 – 🟡 Okay, but review policy carefully",
+      riskScore: parsed.riskScore || "5/10 – 🟡 Mixed",
       riskLevel:
         parsed.riskLevel === "green" ||
         parsed.riskLevel === "yellow" ||
         parsed.riskLevel === "red"
           ? parsed.riskLevel
-          : ("yellow" as const),
+          : "yellow",
       benchmark:
         parsed.benchmark ||
-        "Broadly in line with what Indian brands usually follow.",
+        "Broadly aligned with India’s typical return practices.",
       tip:
         parsed.tip ||
-        "Keep original packaging/tags until you decide to keep the product.",
+        "Keep packaging and tags until you decide to keep the product.",
     };
+
+    // ---------------------------------------------
+    // STORE IN CACHE
+    // ---------------------------------------------
+    cache.set(cacheKey, { timestamp: now, data: response });
 
     return res.status(200).json(response);
   } catch (err: any) {
