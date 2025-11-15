@@ -31,9 +31,9 @@ const client = new OpenAI({
 // ---------------------------------------------
 // SIMPLE IN-MEMORY CACHE
 // ---------------------------------------------
-// NOTE: This cache lives per Vercel function instance.
-// It won't be global across regions but still saves a lot of calls.
+// Lives per Vercel function instance (still saves many calls).
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const CACHE_VERSION = "v1"; // bump when you change scoring logic
 const cache = new Map<string, { timestamp: number; data: ApiResult }>();
 
 // ---------------------------------------------
@@ -62,10 +62,11 @@ Return ONLY valid JSON:
 }
 
 Rules:
-- If ANY detail missing → "Not mentioned".
+- If ANY detail is missing or unclear → "Not mentioned".
 - Strict, vague, or one-sided policies → lower score.
-- Clear, free pickup, long window → higher score.
-- Keep output SHORT.
+- Clear policy, free pickup, refund-to-source, reasonable window → higher score.
+- Score bands: 0–4 = 🔴 High risk, 5–7 = 🟡 Mixed, 8–10 = 🟢 Customer-friendly.
+- Keep everything concise.
 `;
 
 // ---------------------------------------------
@@ -106,7 +107,7 @@ async function fetchHtml(url: string): Promise<string> {
 }
 
 // ---------------------------------------------
-// Scraping logic
+// Scraping logic – find policy page and extract text
 // ---------------------------------------------
 async function extractPolicyText(
   productUrl: string
@@ -121,6 +122,7 @@ async function extractPolicyText(
     const html = await fetchHtml(productUrl);
     const $ = cheerio.load(html);
 
+    // find links that look like return / refund / exchange / cancellation pages
     $("a").each((_, el) => {
       const t = ($(el).text() || "").toLowerCase();
       const h = ($(el).attr("href") || "").toLowerCase();
@@ -136,6 +138,7 @@ async function extractPolicyText(
       }
     });
 
+    // if we found no specific policy page, just use this page's text
     if (candidates.length === 0) {
       $("script, style, noscript").remove();
       const txt = $("body").text().replace(/\s+/g, " ").trim().slice(0, 24000);
@@ -146,20 +149,22 @@ async function extractPolicyText(
     return { text: "", domain };
   }
 
-  // Try candidate pages
-  for (const c of candidates) {
+  // Try each candidate return/refund page
+  for (const candidate of candidates) {
     try {
-      const html = await fetchHtml(c);
+      const html = await fetchHtml(candidate);
       const $ = cheerio.load(html);
       $("script, style, noscript").remove();
       const txt = $("body").text().replace(/\s+/g, " ").trim();
-      if (txt.length > 0) return { text: txt.slice(0, 24000), domain };
+      if (txt.length > 0) {
+        return { text: txt.slice(0, 24000), domain };
+      }
     } catch {
-      // ignore and try next candidate
+      // ignore and move to next candidate
     }
   }
 
-  // Fallback to original
+  // Final fallback: original page text
   try {
     const html = await fetchHtml(productUrl);
     const $ = cheerio.load(html);
@@ -187,40 +192,37 @@ export default async function handler(
     return res.status(200).json(fallbackResponse("Unknown"));
   }
 
-  // ---------------------------------------------
-  // NORMALIZE URL (handles jumkey.com, www.jumkey.com, etc.)
-  // ---------------------------------------------
+  // NORMALIZE URL – handles "jumkey.com", "www.jumkey.com" etc.
   url = url.trim();
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     url = "https://" + url;
   }
 
-  const cacheKey = url; // we cache per normalized URL
+  const cacheKey = `${CACHE_VERSION}|${url}`;
+  const now = Date.now();
 
   // ---------------------------------------------
   // CACHE CHECK
   // ---------------------------------------------
   const cached = cache.get(cacheKey);
-  const now = Date.now();
-
   if (cached && now - cached.timestamp < CACHE_TTL_MS) {
     console.log("Serving from cache:", cacheKey);
     return res.status(200).json(cached.data);
   }
 
-  console.log("Cache miss, fetching + summarising:", cacheKey);
+  console.log("Cache miss, scraping + summarising:", cacheKey);
 
   try {
     const { text: policyText, domain } = await extractPolicyText(url);
 
+    // If we couldn't read any text, return fallback (but don't cache it)
     if (!policyText || policyText.trim().length === 0) {
-      const fallback = fallbackResponse(domain);
-      cache.set(cacheKey, { timestamp: now, data: fallback });
-      return res.status(200).json(fallback);
+      const fb = fallbackResponse(domain);
+      return res.status(200).json(fb);
     }
 
     const userPrompt = `
-Summarize the following policy EXACTLY as JSON:
+Summarize the following policy EXACTLY as JSON in the schema from the system instructions:
 
 """${policyText}"""
 `;
@@ -271,9 +273,7 @@ Summarize the following policy EXACTLY as JSON:
         "Keep packaging and tags until you decide to keep the product.",
     };
 
-    // ---------------------------------------------
-    // STORE IN CACHE
-    // ---------------------------------------------
+    // STORE REAL RESULT IN CACHE
     cache.set(cacheKey, { timestamp: now, data: response });
 
     return res.status(200).json(response);
