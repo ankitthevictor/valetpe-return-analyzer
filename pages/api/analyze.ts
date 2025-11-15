@@ -119,7 +119,7 @@ export default async function handler(
     domain?: string;
   };
 
-  // ✅ NEW: only fallback if there is literally NO text.
+  // If literally no text, we genuinely fallback
   if (!policyText || policyText.trim().length === 0) {
     return res.status(200).json(fallbackResponse(domain || "Unknown"));
   }
@@ -174,8 +174,15 @@ Policy text:
     };
 
     return res.status(200).json(response);
-  } catch (err) {
-    console.error("Fatal error in handler:", err);
-    return res.status(200).json(fallbackResponse(domain || "Unknown"));
+  } catch (err: any) {
+    console.error("OpenAI error in handler:", err);
+    // 🔴 IMPORTANT: now we RETURN an explicit error instead of silent fallback
+    return res
+      .status(500)
+      .json({
+        error:
+          "AI summarisation failed: " +
+          (err?.message || "Unknown error from OpenAI"),
+      });
   }
 }
